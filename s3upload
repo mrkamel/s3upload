@@ -1,0 +1,112 @@
+#!/usr/bin/ruby
+
+require "rubygems"
+require "fileutils"
+require "bundler"
+
+FileUtils.cd(File.dirname(__FILE__)) { Bundler.setup }
+
+require "facets"
+require "optparse"
+require "aws/s3"
+require "yaml"
+
+class String
+  def previous!
+    self[-1] = (self[-1].ord - 1).chr
+
+    self
+  end
+
+  def previous
+    dup.previous!
+  end
+end
+
+module Retry
+  def self.task(num = 3, delay = 30)
+    num.times do |i| 
+      begin
+        return yield
+      rescue => e
+        raise e if i + 1 == num 
+
+        sleep delay
+      end 
+    end 
+  end 
+end
+
+class ObjectFinder
+  def initialize(options = {})
+    @objects = {}
+    @options = options
+    @eof = false
+  end
+
+  def find(key)
+    return if @eof
+    return @objects[key] if @objects[key]
+
+    if @objects.nil? || @objects.last.key < key
+      response = Retry.task { AWS::S3::Bucket.find @options[:bucket], @options.slice(:prefix).merge(:marker => marker) }
+
+      @objects = bucket.objects.each_with_object({}) { |object, hash| hash[object.key] = object }
+
+      @eof = true if response.is_truncated
+    end
+
+    @objects[key]
+  end
+end
+
+def s3upload(bucket, path, options = {}) 
+  AWS::S3::DEFAULT_HOST.replace options[:endpoint] if options[:endpoint]
+
+  AWS::S3::Base.establish_connection! :access_key_id => options[:access_key], :secret_access_key => options[:secret_key]
+
+  object_finder = ObjectFinder.new(options.slice(:bucket, :prefix))
+  
+  File.open(options[:index]).lines.select { |line| line.start_with? options[:prefix] }.sort.collect(&:chomp).each do |relative_path|
+    full_path = File.join(path, relative_path)
+
+    if File.file?(full_path)
+      object = object_finder.find(relative_path)
+
+      if object.nil? || File.size(full_path) != object.size
+        puts "Uploading #{full_path} -> #{relative_path} [#{size} bytes, #{options[:access]}]"
+
+        Retry.task { AWS::S3::S3Object.store relative_path, open(full_path, "rb"), bucket, options.slice(:access) }
+      else
+        puts "Skipping #{full_path}"
+      end 
+    end 
+  end
+end
+
+options = {}
+
+option_parser = OptionParser.new do |parser|
+  parser.on("--config PATH") { |config| options[:config] = config }
+  parser.on("--bucket BUCKET") { |bucket| options[:bucket] = bucket }
+  parser.on("--index INDEX") { |index| options[:index] = index }
+  parser.on("--access ACCESS") { |access| options[:access] = access.to_sym }
+  parser.on("--prefix PREFIX") { |prefix| options[:prefix] = prefix }
+  parser.on("--path PATH") { |path| options[:path] = path }
+end
+
+option_parser.parse!
+
+raise "You did not specify a path to your config file" if options[:config].nil?
+
+options = options.merge(YAML.load_file(options[:config]).symbolize_keys)
+
+raise "You did not specify an access key" if options[:access_key].nil?
+raise "You did not specify a secret key" if options[:secret_key].nil?
+raise "You did not specify a bucket" if options[:bucket].nil?
+raise "You did not specify a path" if options[:path].nil?
+raise "You did not specify an index file" if options[:index].nil?
+raise "You did not specify a valid access (private, public_read)" unless [:private, :public_read].include?(options[:access])
+
+s3upload options[:bucket], options[:path], options.slice(:access_key, :secret_key, :prefix, :endpoint, :index, :access)
+
